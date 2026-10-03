@@ -1,0 +1,331 @@
+#!/bin/bash
+
+set -eux
+
+export HOME=/root
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+
+apt-get install -y \
+  curl \
+  wget \
+  git \
+  unzip \
+  ca-certificates \
+  gnupg \
+  software-properties-common
+
+# --------------------------------------------------
+# Formateur
+# --------------------------------------------------
+
+useradd \
+  --create-home \
+  --shell /bin/bash \
+  formateur
+
+passwd -l formateur
+
+mkdir -p /home/formateur/.ssh
+
+cat <<'EOF' > /home/formateur/.ssh/authorized_keys
+${formateur_public_key}
+EOF
+
+chmod 700 /home/formateur/.ssh
+chmod 600 /home/formateur/.ssh/authorized_keys
+
+chown -R formateur:formateur /home/formateur/.ssh
+
+echo "formateur ALL=(ALL) NOPASSWD:ALL" \
+  > /etc/sudoers.d/formateur
+
+chmod 440 /etc/sudoers.d/formateur
+
+# --------------------------------------------------
+# Terraform
+# --------------------------------------------------
+
+wget -O- https://apt.releases.hashicorp.com/gpg \
+  | gpg --dearmor \
+  | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+
+echo \
+  "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+  https://apt.releases.hashicorp.com \
+  $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+  | tee /etc/apt/sources.list.d/hashicorp.list
+
+apt-get update
+
+apt-get install -y terraform
+
+# --------------------------------------------------
+# AWS CLI
+# --------------------------------------------------
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+  -o "/tmp/awscliv2.zip"
+
+unzip -q /tmp/awscliv2.zip -d /tmp
+
+/tmp/aws/install
+
+# --------------------------------------------------
+# code-server
+# --------------------------------------------------
+
+curl -fsSL https://code-server.dev/install.sh | sh
+
+
+# --------------------------------------------------
+# NGINX + Certbot
+# --------------------------------------------------
+
+apt-get install -y nginx snapd
+
+systemctl enable --now snapd
+
+snap wait system seed.loaded
+
+snap install --classic certbot
+
+ln -sf /snap/bin/certbot /usr/bin/certbot
+
+# --------------------------------------------------
+# Students
+# --------------------------------------------------
+
+student_password=$(echo '${student_password_b64}' | base64 -d)
+
+%{ for student in students ~}
+
+useradd \
+  --create-home \
+  --shell /bin/bash \
+  ${student}
+
+echo "$${student}:$${student_password}" | chpasswd
+
+usermod -aG sudo ${student}
+
+# --------------------------------------------------
+# AWS credentials
+# --------------------------------------------------
+
+mkdir -p /home/${student}/.aws
+
+cat > /home/${student}/.aws/credentials <<EOF
+[default]
+aws_access_key_id = ${student_credentials[student].access_key}
+aws_secret_access_key = ${student_credentials[student].secret_key}
+EOF
+
+cat > /home/${student}/.aws/config <<EOF
+[default]
+region = eu-west-3
+output = json
+EOF
+
+chown -R ${student}:${student} /home/${student}/.aws
+
+chmod 700 /home/${student}/.aws
+chmod 600 /home/${student}/.aws/credentials
+chmod 600 /home/${student}/.aws/config
+
+# --------------------------------------------------
+# AWS Training Credentials
+# --------------------------------------------------
+
+console_password=$(echo '${student_credentials[student].console_password_b64}' | base64 -d)
+
+cat > /home/${student}/AWS-CREDENTIALS.txt <<EOF
+AWS Training Credentials
+========================
+
+AWS Account ID : ${aws_account_id}
+
+IAM Username   : ${student_credentials[student].username}
+
+Console URL    : https://signin.aws.amazon.com/console
+Console Login  : ${student_credentials[student].username}
+Console Password : $${console_password}
+
+AWS Regions autorisées :
+%{ for region in allowed_aws_regions ~}
+  - ${region}
+%{ endfor ~}
+EOF
+
+chown ${student}:${student} /home/${student}/AWS-CREDENTIALS.txt
+chmod 600 /home/${student}/AWS-CREDENTIALS.txt
+
+# --------------------------------------------------
+# Workspace
+# --------------------------------------------------
+
+mkdir -p /home/${student}/workspace
+
+%{ for repo in git_repositories ~}
+git clone ${repo} /home/${student}/workspace/$(basename "${repo}" .git)
+%{ endfor ~}
+
+chown -R ${student}:${student} /home/${student}/workspace
+
+%{ endfor ~}
+
+# --------------------------------------------------
+# code-server - Formateur
+# --------------------------------------------------
+
+
+mkdir -p /home/formateur/.config/code-server
+
+cat > /home/formateur/.config/code-server/config.yaml <<EOF
+bind-addr: 127.0.0.1:8080
+auth: password
+password: $${student_password}
+cert: false
+EOF
+
+chown -R formateur:formateur \
+  /home/formateur/.config
+
+chmod 600 \
+  /home/formateur/.config/code-server/config.yaml
+
+systemctl enable --now code-server@formateur
+
+
+# --------------------------------------------------
+# code-server - Students
+# --------------------------------------------------
+
+%{ for index, student in students ~}
+
+mkdir -p /home/${student}/.config/code-server
+
+cat > /home/${student}/.config/code-server/config.yaml <<EOF
+bind-addr: 127.0.0.1:${8081 + index}
+auth: password
+password: $${student_password}
+cert: false
+EOF
+
+chown -R ${student}:${student} \
+  /home/${student}/.config
+
+chmod 600 \
+  /home/${student}/.config/code-server/config.yaml
+
+systemctl enable --now code-server@${student}
+
+%{ endfor ~}
+
+# --------------------------------------------------
+# NGINX - ACME challenge
+# --------------------------------------------------
+
+mkdir -p /var/www/html/.well-known/acme-challenge
+
+cat > /etc/nginx/sites-available/training-workstation <<EOF
+server {
+    listen 80;
+    server_name ${workstation_public_ip};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+EOF
+
+rm -f /etc/nginx/sites-enabled/default
+
+ln -sf \
+  /etc/nginx/sites-available/training-workstation \
+  /etc/nginx/sites-enabled/training-workstation
+
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx
+
+
+# --------------------------------------------------
+# Let's Encrypt - IP certificate
+# --------------------------------------------------
+
+certbot certonly \
+  --preferred-profile shortlived \
+  --webroot \
+  --webroot-path /var/www/html \
+  --ip-address ${workstation_public_ip} \
+  --non-interactive \
+  --agree-tos \
+  --register-unsafely-without-email
+
+
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+
+cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+#!/bin/bash
+systemctl reload nginx
+EOF
+
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
+cat > /etc/nginx/sites-available/training-workstation <<EOF
+server {
+    listen 80;
+    server_name ${workstation_public_ip};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name ${workstation_public_ip};
+
+    ssl_certificate /etc/letsencrypt/live/${workstation_public_ip}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${workstation_public_ip}/privkey.pem;
+
+%{ for index, student in students ~}
+    location /${student}/ {
+        proxy_pass http://127.0.0.1:${8081 + index}/;
+
+        proxy_http_version 1.1;
+
+        proxy_set_header Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection upgrade;
+
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+%{ endfor ~}
+}
+EOF
+
+nginx -t
+systemctl reload nginx
+
+# --------------------------------------------------
+# Basic tools
+# --------------------------------------------------
+
+apt-get clean
+rm -rf /var/lib/apt/lists/*
