@@ -1,0 +1,31 @@
+output "student_aws_credentials" {
+  description = "Credentials AWS des étudiants"
+
+  value     = module.iam.student_aws_credentials
+  sensitive = true
+}
+
+output "workstation_public_ip" {
+  value = var.create_workstation ? module.workstation[0].workstation_public_ip : null
+}
+
+output "workstation_student_password" {
+  value     = var.create_workstation ? module.workstation[0].student_password : null
+  sensitive = true
+}
+
+
+output "vault_private_ip" {
+  description = "Private IP address of the Vault server"
+  value       = module.vault.vault_private_ip
+}
+
+output "vault_url" {
+  description = "Vault URL accessible from the training VPC"
+  value       = module.vault.vault_url
+}
+
+output "vault_public_ip" {
+  description = "Public IP address of the Vault server"
+  value       = module.vault.vault_public_ip
+}

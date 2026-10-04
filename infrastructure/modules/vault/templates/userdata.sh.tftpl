@@ -1,0 +1,68 @@
+#!/bin/bash
+
+set -eux
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+
+apt-get install -y \
+  curl \
+  wget \
+  git \
+  unzip \
+  jq \
+  gnupg \
+  software-properties-common \
+  ca-certificates \
+  docker.io
+
+systemctl enable --now docker
+
+docker pull hashicorp/vault:latest
+
+docker run -d \
+  --name vault \
+  --restart unless-stopped \
+  -p 8200:8200 \
+  -e VAULT_DEV_ROOT_TOKEN_ID=${vault_token} \
+  -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+  hashicorp/vault:latest
+
+# --------------------------------------------------
+# Formateur
+# --------------------------------------------------
+
+useradd \
+  --create-home \
+  --shell /bin/bash \
+  formateur
+
+passwd -l formateur
+
+mkdir -p /home/formateur/.ssh
+
+cat <<'EOF' > /home/formateur/.ssh/authorized_keys
+${formateur_public_key}
+EOF
+
+chmod 700 /home/formateur/.ssh
+chmod 600 /home/formateur/.ssh/authorized_keys
+
+chown -R formateur:formateur /home/formateur/.ssh
+
+echo "formateur ALL=(ALL) NOPASSWD:ALL" \
+  > /etc/sudoers.d/formateur
+
+chmod 440 /etc/sudoers.d/formateur
+
+# --------------------------------------------------
+# AWS CLI
+# --------------------------------------------------
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+  -o "/tmp/awscliv2.zip"
+
+unzip -q /tmp/awscliv2.zip -d /tmp
+
+/tmp/aws/install

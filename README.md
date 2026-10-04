@@ -1,239 +1,225 @@
-# Terraform Training
+# Terraform Training Workstation — Vault POC
 
-Projet Terraform pour préparer l'environnement d'une session de
-formation Terraform.
+POC d'une plateforme Terraform permettant de créer une workstation de formation AWS avec plusieurs comptes étudiants et une gestion des credentials via HashiCorp Vault.
 
-Le projet est organisé autour de modules afin de séparer :
-
--   la création et la gestion des comptes IAM étudiants ;
--   la création optionnelle d'un workstation AWS de secours.
+> ⚠️ Projet destiné à une formation. Pas conçu pour la production.
 
 ## Architecture
 
-``` text
-terraform-training/
-├── main.tf
-├── variables.tf
-├── terraform.tfvars
-├── outputs.tf
-├── versions.tf
-│
-└── modules/
-    ├── iam/
-    │   ├── iam-users.tf
-    │   ├── ...
-    │   └── README.md
+```text
+PC Formateur
+     │
+     │ IP publique Vault
+     ▼
+┌─────────────────────────────────────────────┐
+│                    AWS                      │
+│                                             │
+│  Workstation EC2 ──── IP privée ────► Vault │
+│       │                                  EC2 │
+│       │ IAM Role                         │  │
+│       ▼                                  │  │
+│ workstation-role                    KV v2   │
+│                                      training
+└─────────────────────────────────────────────┘
+```
+
+## Organisation Terraform
+
+Le projet utilise deux states Terraform indépendants.
+
+### `infrastructure/`
+
+Gère l'infrastructure AWS :
+
+- réseau / VPC
+- Security Groups
+- IAM
+- Workstation EC2
+- Vault EC2
+- Elastic IP
+- Secrets Manager
+- configuration de la workstation
+
+### `vault-config/`
+
+Gère la configuration interne de Vault :
+
+- AWS Auth
+- rôle Vault `workstation`
+- policy `workstation-training`
+- mount KV v2 `training`
+- secrets des étudiants
+
+Cette séparation évite que le `destroy` de l'infrastructure AWS ait besoin de contacter Vault.
+
+## Gestion des credentials
+
+Le projet supporte :
+
+```hcl
+credentials_mode = "local"
+```
+
+```hcl
+credentials_mode = "secrets_manager"
+```
+
+```hcl
+credentials_mode = "vault"
+```
+
+Le POC Vault utilise :
+
+```hcl
+credentials_mode = "vault"
+```
+
+Les credentials sont stockés dans :
+
+```text
+training/
+└── students/
+    ├── student01
+    ├── student02
+    ├── ...
+    └── student10
+```
+
+Chaque secret contient notamment :
+
+- username AWS
+- console password
+- access key
+- secret key
+
+## Authentification Vault
+
+La workstation utilise son rôle IAM AWS pour s'authentifier auprès de Vault :
+
+```text
+Workstation IAM Role
+        │
+        ▼
+Vault AWS Auth
+        │
+        ▼
+role = workstation
+        │
+        ▼
+policy = workstation-training
+        │
+        ▼
+training/students/*
+```
+
+La workstation utilise l'IP privée du serveur Vault.
+
+Le root Terraform `vault-config`, exécuté depuis le PC du formateur, utilise l'IP publique du serveur Vault.
+
+## Mount KV
+
+Le nom du mount est configurable depuis le root `vault-config` :
+
+```hcl
+vault_mount = "training"
+```
+
+Cette valeur est utilisée par :
+
+```text
+vault_mount
     │
-    └── workstation/
-        ├── variables.tf
-        ├── locals.tf
-        ├── data.tf
-        ├── network.tf
-        ├── security-group.tf
-        ├── ec2.tf
-        ├── ...
-        ├── README.md
-        └── templates/
-            └── userdata.sh.tftpl
-
-
-                  ROOT
-                   │
-        ┌──────────┼──────────┐
-        ▼          ▼          ▼
-       IAM       Secrets   Workstation
-        │          │          ▲
-        │          │          │
-        └──────────►──────────┘
-
-
-                    IAM
-                     │
-          AccessKey + SecretKey
-                     │
-                     ▼
-             Workstation
-                     │
-        ┌────────────┼────────────┐
-        ▼            ▼            ▼
-   student01    student02    student03
-        │            │            │
-        ▼            ▼            ▼
-   ~/.aws/       ~/.aws/       ~/.aws/
- credentials    credentials    credentials
-        │            │            │
-        ▼            ▼            ▼
- AWS_PROFILE    AWS_PROFILE    AWS_PROFILE
- = student01    = student02    = student03
-
+    ├──► mount KV
+    ├──► Vault policy
+    └──► vault-secrets
 ```
 
-## Modules
+## Dépendance entre modules
 
-### IAM
+Les secrets étudiants dépendent de la création préalable du mount KV :
 
-Le module `iam` crée les comptes AWS utilisés par les étudiants et leurs
-credentials.
-
-Il expose notamment :
-
-``` text
-student_aws_credentials
-```
-
-Ces credentials sont directement transmis au module `workstation`.
-
-Aucun fichier JSON intermédiaire n'est nécessaire.
-
-### Workstation
-
-Le module `workstation` crée un poste de secours AWS pour les sessions
-où les ordinateurs des étudiants ne sont pas disponibles ou correctement
-configurés.
-
-Le workstation peut être activé ou désactivé depuis le projet racine.
-
-## Paramètres principaux
-
-### Région de déploiement
-
-``` hcl
-aws_region = "us-east-1"
-```
-
-Cette variable correspond à la région dans laquelle l'infrastructure de
-formation est déployée.
-
-### Nombre d'étudiants
-
-``` hcl
-student_count = 10
-```
-
-Le nombre d'étudiants est utilisé par le module IAM et le module
-workstation.
-
-### Régions AWS autorisées
-
-``` hcl
-allowed_aws_regions = [
-  "eu-west-3",
-  "eu-west-1",
-  "eu-central-1",
-  "us-east-1"
+```hcl
+depends_on = [
+  module.vault_config
 ]
 ```
 
-Ces régions correspondent aux régions que les étudiants sont autorisés à
-utiliser pour leurs exercices.
+Ordre :
 
-### Workstation de secours
-
-``` hcl
-create_workstation = true
+```text
+vault-config
+     │
+     ├── AWS Auth
+     ├── Policy
+     └── KV mount
+             │
+             ▼
+       vault-secrets
+             │
+             ▼
+       student01...student10
 ```
 
-Mettre `true` pour créer le workstation.
+## Tests réalisés
 
-Mettre `false` lorsque les ordinateurs des étudiants sont déjà
-configurés et que le workstation de secours n'est pas nécessaire.
+- [x] Création du serveur Vault
+- [x] Création de la workstation
+- [x] Workstation → Vault via IP privée
+- [x] PC → Vault via IP publique
+- [x] Création du mount KV v2
+- [x] Création des secrets étudiants
+- [x] Configuration AWS Auth
+- [x] Configuration de la policy Vault
+- [x] Authentification AWS de la workstation auprès de Vault
+- [x] Lecture d'un secret étudiant depuis la workstation
+- [x] `credentials_mode = "vault"`
+- [x] Récupération des credentials AWS par les étudiants
+- [x] `terraform destroy` de `vault-config`
+- [x] Recréation complète de la configuration Vault
 
-## Déploiement
+## Ordre de destruction
 
-Initialiser Terraform :
+Si Vault est encore disponible :
 
-``` bash
-terraform init
-```
+```text
+1. vault-config
+      ↓
+terraform destroy
 
-Vérifier la configuration :
-
-``` bash
-terraform validate
-```
-
-Afficher le plan :
-
-``` bash
-terraform plan
-```
-
-Appliquer :
-
-``` bash
-terraform apply
-```
-
-Détruire l'environnement :
-
-``` bash
+2. infrastructure
+      ↓
 terraform destroy
 ```
 
-## Outputs
+Si l'EC2 Vault a déjà été détruite, Vault n'est plus accessible. Dans ce cas, ne pas lancer `terraform destroy` dans `vault-config` : le state peut simplement être supprimé puisque les ressources Vault ont déjà disparu avec l'instance.
 
-Le projet racine peut exposer les informations utiles provenant des
-modules, notamment l'adresse IP publique du workstation et son mot de
-passe étudiant lorsqu'il est créé.
+## Limites du POC
 
-Exemples :
+- Vault utilise le mode development.
+- Le root token Vault est utilisé uniquement pour le POC.
+- Les credentials des étudiants sont présents dans le state Terraform.
+- Tous les utilisateurs Linux de la workstation utilisent la même identité IAM de workstation pour l'authentification AWS auprès de Vault.
+- Le serveur Vault est éphémère.
+- Le projet n'est pas destiné à la production.
 
-``` bash
-terraform output workstation_public_ip
-```
+## Objectif pédagogique
 
-Pour une valeur sensible :
+Ce POC montre comment Terraform peut orchestrer :
 
-``` bash
-terraform output -raw student_password
-```
-
-## Principe des modules
-
-Les modules reçoivent leurs paramètres via des variables :
-
-``` text
-Root
-  │
-  ├── variables
-  ▼
-Module
-```
-
-Ils exposent les informations nécessaires au reste du projet via des
-outputs :
-
-``` text
-Module
-  │
-  └── output
-       ▼
-      Root
-```
-
-Le root peut ensuite transmettre l'output d'un module à un autre :
-
-``` text
+```text
+Infrastructure
+      +
 IAM
- │
- └── student_aws_credentials
-          │
-          ▼
-        Root
-          │
-          ▼
-     Workstation
+      +
+Workstation
+      +
+Vault
+      +
+Secrets
+      +
+Authentification AWS
+      +
+Configuration utilisateur
 ```
 
-## Cycle de vie
-
-L'infrastructure est conçue pour être temporaire et peut être
-entièrement supprimée avec :
-
-``` bash
-terraform destroy
-```
-
-Le workstation est optionnel afin de pouvoir utiliser le même projet
-pour différentes sessions de formation.
-
+L'objectif est de montrer que Terraform peut gérer non seulement la création de ressources cloud, mais également l'enchaînement de composants et leurs dépendances.
